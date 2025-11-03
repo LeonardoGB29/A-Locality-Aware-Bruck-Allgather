@@ -7,6 +7,12 @@
 const int N = 2;
 const bool CHECK = true;
 
+static inline int ipow(int base, int exp) {
+    int r = 1;
+    while (exp-- > 0) r *= base;
+    return r;
+}
+
 void bruck_allgather(MPI_Comm comm, int id, int p, int* data, const int* init_data, int n) {
     std::memcpy(data, init_data, n * sizeof(int));
     const int TAG_BASE = 2200;
@@ -59,49 +65,64 @@ void locality_aware_bruck_allgather(MPI_Comm world, int id, int p, int* data, co
     if (id == 0) std::cout << "DEBUG: Paso 1 - Local allgather completed" << std::endl;
 
     const int TAG_BASE = 3300;
+    int steps = (int)std::ceil(std::log(r) / std::log(p_l));
     
-    int my_region = id / p_l;
-    int target_region = (my_region + 1) % r;
-    int source_region = (my_region - 1 + r) % r;
-    
-    int target_id = target_region * p_l + id_l;
-    int source_id = source_region * p_l + id_l;
+    if (id == 0) std::cout << "DEBUG: Non-local steps required: " << steps << std::endl;
 
-    if (id == 0) {
-        std::cout << "DEBUG: Region " << my_region << " communicating with region " << target_region << std::endl;
+    std::vector<int> current_data = local_data;
+    int current_size = n * p_l;
+
+    for (int i = 0; i < steps; i++) {
+        int block_size = n * ipow(p_l, i);
+        int exchange_size = block_size * p_l;
+        
+        int region_step = ipow(p_l, i);
+        int target_region_offset = (id_l * region_step) % r;
+        
+        int local_region_id = id / p_l;
+        int target_region = (local_region_id + target_region_offset) % r;
+        int source_region = (local_region_id - target_region_offset + r) % r;
+        
+        int target_process = target_region * p_l + id_l;
+        int source_process = source_region * p_l + id_l;
+
+        if (id == 0) {
+            std::cout << "DEBUG: Step " << i << ": Region " << local_region_id 
+                      << " sending to region " << target_region 
+                      << " (offset " << target_region_offset << ")" << std::endl;
+        }
+
+        std::vector<int> recv_data(exchange_size);
+        
+        if (id_l > 0) {
+            MPI_Sendrecv(current_data.data(), exchange_size, MPI_INT, target_process, TAG_BASE + i,
+                        recv_data.data(), exchange_size, MPI_INT, source_process, TAG_BASE + i,
+                        world, MPI_STATUS_IGNORE);
+        } else {
+            MPI_Recv(recv_data.data(), exchange_size, MPI_INT, source_process, TAG_BASE + i,
+                    world, MPI_STATUS_IGNORE);
+        }
+
+        std::vector<int> combined_data(current_size + exchange_size);
+        std::memcpy(combined_data.data(), current_data.data(), current_size * sizeof(int));
+        std::memcpy(combined_data.data() + current_size, recv_data.data(), exchange_size * sizeof(int));
+        
+        int new_local_size = current_size + exchange_size;
+        std::vector<int> new_local_data(new_local_size * p_l);
+        bruck_allgather(local_comm, id_l, p_l, new_local_data.data(), combined_data.data(), new_local_size);
+        
+        current_data = new_local_data;
+        current_size = new_local_size * p_l;
+        
+        if (id == 0) std::cout << "DEBUG: Step " << i << " completed, current size: " << current_size << std::endl;
     }
 
-    std::vector<int> recv_data(n * p_l);
-    
-    MPI_Sendrecv(local_data.data(), n * p_l, MPI_INT, target_id, TAG_BASE,
-                recv_data.data(), n * p_l, MPI_INT, source_id, TAG_BASE,
-                world, MPI_STATUS_IGNORE);
-
-    if (id == 0) std::cout << "DEBUG: Paso 2 - Non-local communication completed" << std::endl;
-
-    std::vector<int> combined_data(n * p_l * 2);
-    std::memcpy(combined_data.data(), local_data.data(), n * p_l * sizeof(int));
-    std::memcpy(combined_data.data() + n * p_l, recv_data.data(), n * p_l * sizeof(int));
-
-    if (id == 0) std::cout << "DEBUG: Combined data size: " << combined_data.size() << std::endl;
-
-    std::vector<int> final_data(combined_data.size() * p_l);
-    bruck_allgather(local_comm, id_l, p_l, final_data.data(), combined_data.data(), combined_data.size());
-
-    if (id == 0) std::cout << "DEBUG: Paso 4 - Final local allgather completed" << std::endl;
-
-    if (final_data.size() >= n * p) {
-        std::memcpy(data, final_data.data(), n * p * sizeof(int));
-    } else {
-        std::memcpy(data, final_data.data(), final_data.size() * sizeof(int));
-    }
+    std::memcpy(data, current_data.data(), n * p * sizeof(int));
 
     std::vector<int> tmp(n * p);
     for (int j = 0; j < p; ++j) {
         int src = (j + id) % p;
-        if (src * n < n * p) {
-            std::memcpy(tmp.data() + j * n, data + src * n, n * sizeof(int));
-        }
+        std::memcpy(tmp.data() + j * n, data + src * n, n * sizeof(int));
     }
     std::memcpy(data, tmp.data(), n * p * sizeof(int));
 
@@ -122,7 +143,7 @@ int main(int argc, char** argv) {
 
     if (CHECK) {
         if (id == 0) {
-            std::cout << "=== Testing Locality-Aware Bruck ===" << std::endl;
+            std::cout << "=== Testing Locality-Aware Bruck (Paper Version) ===" << std::endl;
             std::cout << "Processes: " << p << ", Data per process: " << N << " integers" << std::endl;
         }
 
@@ -146,18 +167,6 @@ int main(int argc, char** argv) {
         
         if (id == 0) {
             std::cout << "Final Check: " << (global_ok ? "PASS" : "FAIL") << std::endl;
-            if (!global_ok) {
-                std::cout << "Expected: ";
-                for (int i = 0; i < std::min(8, N * p); i++) {
-                    std::cout << gold[i] << " ";
-                }
-                std::cout << std::endl;
-                std::cout << "Got: ";
-                for (int i = 0; i < std::min(8, N * p); i++) {
-                    std::cout << out[i] << " ";
-                }
-                std::cout << std::endl;
-            }
         }
     }
 

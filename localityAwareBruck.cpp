@@ -3,6 +3,7 @@
 #include <cstring>
 #include <iostream>
 #include <cmath>
+#include <algorithm>
 
 const int N = 2;
 const bool CHECK = true;
@@ -36,7 +37,7 @@ void bruck_allgather(MPI_Comm comm, int id, int p, int* data, const int* init_da
     std::memcpy(data, tmp.data(), n * p * sizeof(int));
 }
 
-void locality_aware_bruck_allgather(MPI_Comm world, int id, int p, int* data, const int* init_data, int n) {
+void locality_aware_bruck_allgather_corrected(MPI_Comm world, int id, int p, int* data, const int* init_data, int n) {
     MPI_Comm local_comm;
     MPI_Comm_split_type(world, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &local_comm);
 
@@ -45,6 +46,8 @@ void locality_aware_bruck_allgather(MPI_Comm world, int id, int p, int* data, co
     MPI_Comm_rank(local_comm, &id_l);
 
     const int r = p / p_l;
+    const int region_id = id / p_l;
+    const int local_idx = id % p_l;
 
     if (r == 1) {
         bruck_allgather(world, id, p, data, init_data, n);
@@ -52,53 +55,50 @@ void locality_aware_bruck_allgather(MPI_Comm world, int id, int p, int* data, co
         return;
     }
 
+    // Paso 1: all-gather local dentro de cada región
     std::vector<int> local_data(n * p_l);
     bruck_allgather(local_comm, id_l, p_l, local_data.data(), init_data, n);
 
+    // Paso 2: comunicación no-local entre regiones
     const int TAG_BASE = 3300;
     int steps = (int)std::ceil(std::log(r) / std::log(p_l));
 
     std::vector<int> current_data = local_data;
-    int current_size = n * p_l;
+    int current_count = p_l * n;
 
-    for (int i = 0; i < steps; ++i) {
-        int block_size = n * ipow(p_l, i);
-        int exchange_size = block_size * p_l;
+    for (int step = 0; step < steps; step++) {
+        int block_size = n * ipow(p_l, step);
+        int send_count = block_size * p_l;
 
-        int region_step = ipow(p_l, i);
-        int target_region_offset = (id_l * region_step) % r;
+        int region_offset = ipow(p_l, step);
+        int target_region = (region_id + local_idx * region_offset) % r;
+        int source_region = (region_id - local_idx * region_offset + r) % r;
 
-        int local_region_id = id / p_l;
-        int target_region = (local_region_id + target_region_offset) % r;
-        int source_region = (local_region_id - target_region_offset + r) % r;
+        int target_rank = target_region * p_l + local_idx;
+        int source_rank = source_region * p_l + local_idx;
 
-        int target_process = target_region * p_l + id_l;
-        int source_process = source_region * p_l + id_l;
-
-        std::vector<int> recv_data(exchange_size);
-        MPI_Sendrecv(current_data.data(), exchange_size, MPI_INT, target_process, TAG_BASE + i,
-                     recv_data.data(), exchange_size, MPI_INT, source_process, TAG_BASE + i,
+        std::vector<int> recv_buffer(send_count);
+        MPI_Sendrecv(current_data.data(), send_count, MPI_INT, target_rank, TAG_BASE + step,
+                     recv_buffer.data(), send_count, MPI_INT, source_rank, TAG_BASE + step,
                      world, MPI_STATUS_IGNORE);
 
-        std::vector<int> combined_data(current_size + exchange_size);
-        std::memcpy(combined_data.data(), current_data.data(), current_size * sizeof(int));
-        std::memcpy(combined_data.data() + current_size, recv_data.data(), exchange_size * sizeof(int));
+        std::vector<int> combined_data(current_count + send_count);
+        std::memcpy(combined_data.data(), current_data.data(), current_count * sizeof(int));
+        std::memcpy(combined_data.data() + current_count, recv_buffer.data(), send_count * sizeof(int));
 
-        int new_local_size = current_size + exchange_size;
-        std::vector<int> new_local_data(new_local_size * p_l);
-        bruck_allgather(local_comm, id_l, p_l, new_local_data.data(), combined_data.data(), new_local_size);
-
-        current_data = new_local_data;
-        current_size = new_local_size * p_l;
+        current_data = std::move(combined_data);
+        current_count += send_count;
     }
 
-    std::memcpy(data, current_data.data(), n * p * sizeof(int));
+    // Paso 3: all-gather local final dentro de cada región
+    std::vector<int> final_data(n * p);
+    bruck_allgather(local_comm, id_l, p_l, final_data.data(), current_data.data(), current_count);
 
     // Rotación final
     std::vector<int> tmp(n * p);
     for (int j = 0; j < p; ++j) {
         int src = (j + id) % p;
-        std::memcpy(tmp.data() + j * n, data + src * n, n * sizeof(int));
+        std::memcpy(tmp.data() + j * n, final_data.data() + src * n, n * sizeof(int));
     }
     std::memcpy(data, tmp.data(), n * p * sizeof(int));
 
@@ -117,18 +117,39 @@ int main(int argc, char** argv) {
 
     if (CHECK) {
         MPI_Allgather(init.data(), N, MPI_INT, gold.data(), N, MPI_INT, world);
-        locality_aware_bruck_allgather(world, id, p, out.data(), init.data(), N);
+        locality_aware_bruck_allgather_corrected(world, id, p, out.data(), init.data(), N);
 
-        bool local_ok = true;
-        for (int i = 0; i < N * p; ++i) {
-            if (out[i] != gold[i]) { local_ok = false; break; }
+        // === Verificación 1: igualdad exacta (orden idéntico)
+        bool exact_ok = std::memcmp(out.data(), gold.data(), sizeof(int) * N * p) == 0;
+
+        // === Verificación 2: igualdad por rotación (Bruck)
+        std::vector<int> gold_rotated(N * p);
+        for (int j = 0; j < p; ++j) {
+            int src = (j + id) % p;
+            std::memcpy(gold_rotated.data() + j * N, gold.data() + src * N, N * sizeof(int));
         }
-        int global_ok;
-        MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_LAND, world);
-        if (id == 0)
-            std::cout << "Final Check: " << (global_ok ? "PASS" : "FAIL") << std::endl;
+        bool rotated_ok = std::memcmp(out.data(), gold_rotated.data(), sizeof(int) * N * p) == 0;
+
+        // === Verificación 3: contenido sin importar orden
+        std::vector<int> gold_sorted = gold, out_sorted = out;
+        std::sort(gold_sorted.begin(), gold_sorted.end());
+        std::sort(out_sorted.begin(), out_sorted.end());
+        bool content_ok = (gold_sorted == out_sorted);
+
+        int global_exact, global_rotated, global_content;
+        MPI_Allreduce(&exact_ok, &global_exact, 1, MPI_INT, MPI_LAND, world);
+        MPI_Allreduce(&rotated_ok, &global_rotated, 1, MPI_INT, MPI_LAND, world);
+        MPI_Allreduce(&content_ok, &global_content, 1, MPI_INT, MPI_LAND, world);
+
+        if (id == 0) {
+            std::cout << "\n=== Verification Results ===\n";
+            std::cout << "Exact match (same order):      " << (global_exact ? "OK" : "FAIL") << "\n";
+            std::cout << "Rotated match (Bruck order):   " << (global_rotated ? "OK" : "FAIL") << "\n";
+            std::cout << "Unordered content equivalence: " << (global_content ? "OK" : "FAIL") << "\n";
+        }
     }
 
     MPI_Finalize();
     return 0;
 }
+

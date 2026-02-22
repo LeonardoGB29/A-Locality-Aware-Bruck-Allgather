@@ -57,7 +57,6 @@ Se compara contra `MPI_Allgather` para verificar correctitud:
 
 ## Resultados
 
-> Coloca estas imágenes en `imgs/` (o cambia rutas).
 
 **Figura 1.** Speedup del Locality-Aware Bruck vs baseline (MPI nativo).  
 ![Figura 1 - Speedup](imgs/speedup.png)
